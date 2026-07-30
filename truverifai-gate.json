@@ -1,0 +1,16 @@
+{
+  "preToolUse": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash \"__GATES__/run_gate.sh\" copilot_cli deliberate_gate.py"
+        },
+        {
+          "type": "command",
+          "command": "bash \"__GATES__/run_gate.sh\" copilot_cli audit_gate.py"
+        }
+      ]
+    }
+  ]
+}
