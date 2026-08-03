@@ -114,7 +114,11 @@ class Host(object):
         new = ti.get("new_string") if ti.get("new_string") is not None else (
             ti.get("newText") if ti.get("newText") is not None else ti.get("new_str"))
         content = ti.get("content") if ti.get("content") is not None else (
-            ti.get("contents") if ti.get("contents") is not None else ti.get("text"))
+            ti.get("contents") if ti.get("contents") is not None else (
+                ti.get("text") if ti.get("text") is not None else
+                # Copilot CLI's `create` tool (live capture 2026-08-02):
+                # {"path": ..., "file_text": ...}
+                ti.get("file_text")))
         if path and old is not None and new is not None:
             return "Edit", {"file_path": path, "old_string": old, "new_string": new}
         if path and content is not None:
@@ -168,3 +172,18 @@ class Host(object):
         except Exception:
             pass
         sys.exit(0)
+
+    def emit_post_advisory(self, message, event_name="PostToolUse"):
+        """POST-hook model-visible advisory (the post-commit backstop). Base =
+        Claude Code / Codex wire; hosts with a different post contract override.
+        Does NOT exit — post hooks fall through to their own exit 0."""
+        try:
+            ev = event_name if event_name in ("PostToolUse",
+                                              "PostToolUseFailure") else "PostToolUse"
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": ev,
+                "additionalContext": message,
+            }}))
+            sys.stdout.flush()
+        except Exception:
+            pass
