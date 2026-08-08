@@ -29,6 +29,18 @@ import time
 import urllib.request
 
 import host as host_registry  # per-platform adapter layer (same dir, host/ package)
+
+# Tamper-evidence self-check (deliberation mcp_516e5fa1). Runs ONCE at first
+# gate load, cached, NEVER raises: if an installed gate file was modified since
+# install it warns loudly on stderr and we tag the coverage POST — but we FAIL
+# OPEN (never block). Import defensively so a missing/older integrity module
+# (or any error) degrades to no check, exactly like an old install.
+try:
+    import integrity as _integrity          # vendored, same dir
+    _GATE_INTEGRITY = _integrity.check_gate_integrity()
+except Exception:
+    _integrity = None
+    _GATE_INTEGRITY = "unchecked"
 from risk_classifier import (  # vendored, same dir
     classify_diff,
     hunk_content_hash,
@@ -332,6 +344,332 @@ def repo_relative_area(path, cwd):
             rel = rel.replace("\\", "/")
             return "repo-root" if rel == "." else rel
     return d.replace("\\", "/") or "repo-root"
+
+
+# ---------------------------------------------------------------------------
+# Effective-cwd resolution (deliberation mcp_45f1a19b, 2026-08-05)
+# ---------------------------------------------------------------------------
+# THE INCIDENT: Codex's shell tool takes a per-call `workdir` ARGUMENT; agents
+# run bare `git commit` with workdir=<a nested repo>. The gates read only the
+# payload/session cwd, so the commit gate diffed the PARENT repo and risky
+# commits in the sub-repos landed with zero deny (prod smoke 2026-08-05).
+# Related shapes: chained `cd X && git commit` (every host reads cwd at command
+# START) and `git -C <path> commit`.
+#
+# THE DESIGN (correct by construction, host-independent): emulate the actual
+# resolution the shell + git will perform, in their own precedence order:
+#   base   = the payload/session cwd (today's behavior, always the fallback)
+#   stage1 = a directory-ish TOOL ARGUMENT (generic normalized key sweep — a
+#            host renaming workDir -> workingDirectory still matches; adapters
+#            pass RAW args and never decide which field is the directory)
+#   stage2 = the cd/pushd/Set-Location chain in the command text BEFORE the
+#            gated git segment (emulated sequentially, so relative cds compose)
+#   stage3 = `git -C <path>` on the gated git segment (git's own override, last)
+# Every stage promotes its candidate ONLY if the path exists AND resolves a git
+# toplevel; anything unparseable/ambiguous (env vars in paths, unknown flags,
+# no-space operators) keeps the previous stage's answer — the worst case is
+# byte-for-byte today's behavior. FAIL OPEN when blind, structurally.
+#
+# Consumers: the three COMMIT-side scripts (audit_gate, post_commit_backstop,
+# stash_precommit_head) + repo_fingerprint via the cwd they pass. The write
+# gate is untouched (its risk detection is payload-content-driven).
+
+# Known host key names (canonical list — audit mcp_a91ec2e1 F-005; the test
+# suite pins behavior, THIS is the provenance record; verified per-host by the
+# 2026-08-05 owner-run captures, CWD-CAPTURE-EVIDENCE-2026-08-05.md):
+#   Codex `workdir` (honored — the incident); Gemini `dir_path` (honored —
+#   NOT the documented `directory`; hence "dirpath" below); Cursor CLI+IDE
+#   `cwd` in tool args (honored); Antigravity `Cwd` in toolCall.args
+#   (honored; PascalCase caught by normalization); Copilot CLI + VS Code =
+#   NO dir arg (they wrap cd-chains in a cmd.exe subshell — see
+#   _unwrap_subshell); Claude Code = none (shell persists + reports true
+#   cwd). Every capturing host honored its arg, so no
+#   capabilities["honors_dir_arg"]=False opt-outs ship; the mechanism stays
+#   for any future host that doesn't.
+_DIR_ARG_PRIORITY = ("workdir", "workingdirectory", "workingdir", "directory",
+                     "dirpath", "rootdir", "cwd", "dir")
+
+
+def _norm_key(k):
+    return str(k).replace("_", "").replace("-", "").lower()
+
+
+def _dir_arg_candidate(tool_input):
+    """The most-specific directory-ish tool argument, or None. Sweeps the raw
+    args dict (flat + one nested level, and a JSON-string args blob — the
+    Copilot shape) with normalized key matching; values must be non-empty
+    strings without env-var syntax (conservative — no expansion guessing)."""
+    ti = tool_input
+    if isinstance(ti, str):
+        try:
+            ti = json.loads(ti)
+        except Exception:
+            return None
+    if not isinstance(ti, dict):
+        return None
+    found = {}
+    levels = [ti] + [v for v in ti.values() if isinstance(v, dict)]
+    for d in levels:
+        for k, v in d.items():
+            nk = _norm_key(k)
+            if nk in _DIR_ARG_PRIORITY and nk not in found and \
+                    isinstance(v, str) and v.strip() and "$" not in v and "%" not in v:
+                found[nk] = v.strip()
+    for nk in _DIR_ARG_PRIORITY:
+        if nk in found:
+            return found[nk]
+    return None
+
+
+def _split_shell_segments(command):
+    """Split a shell command string into sequential segments on unquoted
+    separators (&&, ||, ;, |, &, newline). Quote-aware for ' and \"; escapes
+    (backtick/caret) are NOT interpreted — a segment that misparses simply
+    fails validation downstream and the resolver keeps its prior answer."""
+    segs, cur, quote = [], [], None
+    i, n = 0, len(command or "")
+    while i < n:
+        c = command[i]
+        if quote:
+            cur.append(c)
+            if c == quote:
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+            cur.append(c)
+        elif c in (";", "\n", "|", "&"):
+            segs.append("".join(cur))
+            cur = []
+            if i + 1 < n and c in ("|", "&") and command[i + 1] == c:
+                i += 1
+        else:
+            cur.append(c)
+        i += 1
+    segs.append("".join(cur))
+    return [s.strip() for s in segs if s.strip()]
+
+
+def _unquote(tok):
+    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
+        return tok[1:-1]
+    return tok
+
+
+def _seg_tokens(seg):
+    try:
+        import shlex
+        # posix=False keeps Windows backslashes and quoted paths-with-spaces
+        # intact (the parse_git_add_targets lesson, 2026-08-03).
+        return shlex.split(seg, posix=False)
+    except Exception:
+        return seg.split()
+
+_CD_VERBS = ("cd", "chdir", "set-location", "sl", "pushd", "push-location")
+_POP_VERBS = ("popd", "pop-location")
+
+
+class _ChainAbort(Exception):
+    """A directory op we can't emulate confidently — abandon stage 2.
+
+    KNOWN GAP, not just a safety valve (audit mcp_a91ec2e1 F-002): aborting
+    falls back to the payload cwd, which is exactly the pre-fix behavior — so
+    a `cd $VAR && git commit` or a cd with an unrecognized flag is still
+    mis-gated against the session root, silently. Accepted under the hard
+    fail-open-when-blind rule (guessing an expansion could gate the WRONG
+    repo, which is worse); the residual shape is observable via
+    TVAI_PAYLOAD_LOG (cwd_source stays "payload"/"dir_arg" despite a cd in
+    the command)."""
+
+
+def _cd_target_from_tokens(tokens):
+    """The target path of a cd-family token list, or raise _ChainAbort."""
+    i = 1
+    while i < len(tokens):
+        t = _unquote(tokens[i])
+        tl = t.lower()
+        if tl == "/d":                       # cmd.exe drive-change flag
+            i += 1
+            continue
+        if tl in ("-path", "-literalpath"):  # PowerShell named parameter
+            if i + 1 < len(tokens):
+                t = _unquote(tokens[i + 1])
+                break
+            raise _ChainAbort()
+        if t.startswith("-"):                # unknown flag: could take a value
+            raise _ChainAbort()
+        break
+    else:
+        raise _ChainAbort()                  # bare `cd` (home) / `cd -`: don't guess
+    if not t or t == "-" or "$" in t or "%" in t:
+        raise _ChainAbort()
+    return t
+
+
+def _emulate_cd_chain(segments, start_dir):
+    """Apply the cd/pushd chain across `segments` sequentially from start_dir.
+    Returns the final dir, or None if no directory op was seen; raises
+    _ChainAbort on anything we can't emulate confidently."""
+    cur, stack, seen = start_dir, [], False
+    for seg in segments:
+        tokens = _seg_tokens(seg)
+        if not tokens:
+            continue
+        verb = _unquote(tokens[0]).lower()
+        if verb in _CD_VERBS:
+            target = _cd_target_from_tokens(tokens)
+            new = os.path.normpath(os.path.join(cur, os.path.expanduser(target)))
+            if verb in ("pushd", "push-location"):
+                stack.append(cur)
+            cur, seen = new, True
+        elif verb in _POP_VERBS:
+            if not stack:
+                raise _ChainAbort()
+            cur, seen = stack.pop(), True
+    return cur if seen else None
+
+
+def _git_c_dir(git_segment, start_dir):
+    """Cumulative `git -C <path>` resolution on the gated git segment (git
+    applies multiple -C flags in order, each relative to the last). Returns
+    the resolved dir or None when no -C is present."""
+    tokens = _seg_tokens(git_segment)
+    cur, seen, i = start_dir, False, 0
+    while i < len(tokens):
+        if _unquote(tokens[i]) == "-C" and i + 1 < len(tokens):
+            target = _unquote(tokens[i + 1])
+            if not target or "$" in target or "%" in target:
+                return None
+            cur = os.path.normpath(os.path.join(cur, os.path.expanduser(target)))
+            seen = True
+            i += 2
+            continue
+        i += 1
+    return cur if seen else None
+
+
+def _is_git_dir(d):
+    try:
+        return os.path.isdir(d) and bool(_git(["rev-parse", "--show-toplevel"], d).strip())
+    except Exception:
+        return False
+
+
+# Subshell wrappers (2026-08-05 captures): BOTH Copilot-runtime hosts
+# (Copilot CLI and the VS Code agent) wrap every chained command in a cmd.exe
+# subshell — `& $env:ComSpec /c "cd <path> && git commit ..."` — putting the
+# cd-chain inside a quoted ARGUMENT where the segment parser can't see it.
+# The resolver unwraps the common wrapper shapes and recurses into the quoted
+# command. Conservative: only when the wrapper's payload is the LAST token
+# (no trailing args to mis-scope) and only to a bounded depth.
+_SUBSHELL_CMD = ("cmd", "cmd.exe", "$env:comspec", "%comspec%")
+_SUBSHELL_PS = ("powershell", "powershell.exe", "pwsh", "pwsh.exe")
+_SUBSHELL_SH = ("bash", "sh", "bash.exe", "sh.exe")
+
+
+def _unwrap_subshell(command, depth=3):
+    """Peel `cmd /c \"...\"` / `powershell -Command \"...\"` / `bash -c '...'`
+    wrappers, returning the inner command string. Returns the input unchanged
+    when the shape isn't confidently a single-payload wrapper."""
+    for _ in range(depth):
+        segments = _split_shell_segments(command)
+        # `& $env:ComSpec /c "..."` splits on the leading PowerShell call
+        # operator into ["", "$env:ComSpec /c \"...\""]; drop empties.
+        segments = [s for s in segments if s]
+        if len(segments) != 1:
+            return command
+        tokens = _seg_tokens(segments[0])
+        if tokens and tokens[0] == "&":            # PowerShell call operator
+            tokens = tokens[1:]
+        if len(tokens) < 3:
+            return command
+        exe = _unquote(tokens[0]).lower().rstrip()
+        flag = _unquote(tokens[1]).lower()
+        if exe in _SUBSHELL_CMD and flag in ("/c", "/k"):
+            pass
+        elif exe in _SUBSHELL_PS and flag in ("-command", "-c"):
+            pass
+        elif exe in _SUBSHELL_SH and flag == "-c":
+            pass
+        else:
+            return command
+        # Payload must be the last token — a lone quoted command string. More
+        # tokens after it = args we can't attribute; keep the outer command.
+        if len(tokens) != 3:
+            return command
+        inner = _unquote(tokens[2])
+        if not inner or inner == command:
+            return command
+        command = inner
+    return command
+
+
+def resolve_effective_cwd(inp, subcommands=("commit", "merge")):
+    """(effective_cwd, source) for the gated git command in a shell payload.
+
+    source is one of payload | dir_arg | cd_chain | git_c — logged/telemetered
+    so payload-shape drift is observable. Any failure returns the payload cwd
+    (today's behavior); this function must never raise."""
+    base = (inp or {}).get("cwd") or os.getcwd()
+    cur, source = base, "payload"
+    try:
+        ti = (inp or {}).get("tool_input") or {}
+        # Stage-1 opt-out (audit mcp_a91ec2e1 F-001): skip the dir-arg stage on
+        # a host proven NOT to honor its own directory argument — trusting it
+        # would bind receipts to a repo the command never ran in, which LOOKS
+        # correct (worse than the honest fallback). Opt-out = payload-cwd
+        # fallback for this stage only; errors default to honoring (True).
+        try:
+            honors = host_registry.current().capabilities.get("honors_dir_arg", True)
+        except Exception:
+            honors = True
+        cand = _dir_arg_candidate(ti) if honors else None
+        if cand:
+            p = os.path.normpath(os.path.join(base, os.path.expanduser(cand)))
+            if _is_git_dir(p):
+                cur, source = p, "dir_arg"
+        command = ti.get("command", "") if isinstance(ti, dict) else ""
+        if isinstance(command, str) and command:
+            command = _unwrap_subshell(command)
+            segments = _split_shell_segments(command)
+            gate_idx = next((i for i, s in enumerate(segments)
+                             if command_invokes_git(s, subcommands)), None)
+            if gate_idx is not None:
+                try:
+                    chained = _emulate_cd_chain(segments[:gate_idx], cur)
+                except _ChainAbort:
+                    chained = None
+                if chained and _is_git_dir(chained):
+                    cur, source = chained, "cd_chain"
+                dash_c = _git_c_dir(segments[gate_idx], cur)
+                if dash_c and _is_git_dir(dash_c):
+                    cur, source = dash_c, "git_c"
+        _payload_log({"event": "resolve_effective_cwd", "base": base,
+                      "resolved": cur, "cwd_source": source})
+        return cur, source
+    except Exception:
+        return base, "payload"
+
+
+def _payload_log(obj):
+    """TVAI_PAYLOAD_LOG diagnostics (deliberation mcp_45f1a19b, drift layer):
+    when the env var is set, append a JSON line to the log file — the value is
+    the file path, or any other truthy value for the default
+    ~/.truverifai/payload_log.jsonl. Local-only, owner-opt-in, best-effort;
+    never raises, never changes gate behavior."""
+    dest = os.environ.get("TVAI_PAYLOAD_LOG")
+    if not dest:
+        return
+    try:
+        import datetime
+        path = dest if os.sep in dest or dest.endswith(".jsonl") else \
+            os.path.join(os.path.expanduser("~"), ".truverifai", "payload_log.jsonl")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "ts": datetime.datetime.utcnow().isoformat() + "Z",
+                **obj,
+            }, default=str) + "\n")
+    except Exception:
+        pass
 
 
 def is_out_of_repo_scope(path, cwd):
@@ -702,6 +1040,39 @@ def file_content_fetcher(cwd):
 # unhook it) — always-risky regardless of content (design §6.1, audit F-005).
 
 
+def repo_relative_path(path, cwd):
+    """`path` relativized against the repo root (forward slashes), or the
+    forward-slashed original when it can't be. Used by the gate-self write
+    branch so the synthesized self-coverage diff carries the SAME path a
+    reviewer's unified diff carries (repo-relative). The absolute tool-input
+    path made the gself hash unmatchable by any server receipt — the wire
+    protocol never carries local paths, so the server can never mint a hash
+    containing one (gate-self-write-deadlock-postmortem, 2026-08-08).
+
+    TOTAL / never-raises (it runs on the gate path): a broad `except` returns
+    the forward-slashed input on any failure (git absent, subprocess error,
+    _git returning None so .strip() would AttributeError, cross-drive ValueError
+    from relpath). FAIL-SAFE by construction: any wrong result here (bad cwd,
+    outside-repo, `..`, or the `.`-at-root degenerate) just reproduces the OLD
+    mismatch (coverage misses -> re-review) — it can NEVER over-release, and it
+    NEVER touches a non-gate-self change."""
+    if not isinstance(path, str) or not path:
+        return ""            # non-str/empty -> safe no-op (server never matches -> re-review)
+    p = path.replace("\\", "/")
+    try:
+        root = _git(["rev-parse", "--show-toplevel"], cwd).strip()
+        if root:
+            rel = os.path.relpath(path, root)
+            # Guard the degenerate cases: outside the repo (`..`) and path==root
+            # (`.`, which would synth a malformed `+++ b/.` header) — both fall
+            # through to the original path (F-002).
+            if rel != "." and not rel.startswith(".."):
+                return rel.replace("\\", "/")
+    except Exception:
+        pass
+    return p
+
+
 def synth_write_diff(path, added_text):
     """Synthesize a unified diff for a Write/Edit so the classifier (which speaks
     unified-diff) can score the content being written. All-adds shape (`@@ -0,0
@@ -857,7 +1228,17 @@ def _post(cfg, path, body):
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            parsed = json.loads(resp.read().decode("utf-8"))
+            # Option B (update nudge): stash the server's staleness flag for
+            # this hook process; emit_deny / the backstop render it later.
+            # Best-effort — a nudge must never affect a gate POST.
+            try:
+                if isinstance(parsed, dict) and isinstance(parsed.get("gate_update"), dict):
+                    global _GATE_UPDATE
+                    _GATE_UPDATE = parsed["gate_update"]
+            except Exception:
+                pass
+            return parsed
     except Exception:
         return None
 
@@ -1053,6 +1434,10 @@ def transparency_block(classification, check_response, max_items=8):
 def check_audit_coverage(cfg, repo, hunk_hashes, classification=None, session_id=None,
                          is_merge=False):
     body = {"repo": repo, "hunks": hunk_hashes}
+    # Option B (update nudge): report our version so the server can flag
+    # staleness in the response. Additive; old servers ignore it.
+    body["gate_version"] = plugin_version()
+    body["gate_integrity"] = _GATE_INTEGRITY  # tamper-evidence flag (additive)
     if is_merge:
         # Wave 3 (§3.3): stamp the fire as a merge so branch_already_reviewed is
         # admissible on it (server-enforced; additive — old servers ignore it).
@@ -1077,6 +1462,8 @@ def check_deliberate_unlock(cfg, repo, area, session_id, classification=None,
                             gate_type="deliberate"):
     # session_id already rides in the body, so don't duplicate it via _classifier_meta.
     body = {"repo": repo, "area": area, "session_id": session_id}
+    body["gate_version"] = plugin_version()  # Option B update nudge (additive)
+    body["gate_integrity"] = _GATE_INTEGRITY  # tamper-evidence flag (additive)
     body.update(_classifier_meta(classification, session_id=None))
     # The write gate splits into a deliberate tier (high-confidence fork) and a
     # synthesize tier (borderline); the caller knows which fired, so the fire records
@@ -1942,9 +2329,14 @@ def read_hook_input():
     # A normalizer error fails open to the RAW payload: the gates allow any tool
     # they don't recognize, so a broken adapter can never trap the agent.
     try:
-        return host_registry.current().normalize_input(parsed)
+        normalized = host_registry.current().normalize_input(parsed)
     except Exception:
-        return parsed
+        normalized = parsed
+    # Drift diagnostics: with TVAI_PAYLOAD_LOG set, record the raw + normalized
+    # payload so any future payload-shape investigation is a one-env-var
+    # operation instead of a hand-built canary (deliberation mcp_45f1a19b).
+    _payload_log({"event": "hook_input", "raw": parsed, "normalized": normalized})
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -2054,6 +2446,79 @@ def host_run(fn):
     h.run(fn)
 
 
+# ---------------------------------------------------------------------------
+# Option B — server-driven gate update nudge (design doc:
+# docs/MCP/Cross platform adoption/OPTION-B-GATE-UPDATE-NUDGE.md).
+# The coverage response may carry {"gate_update": {"latest_version", "is_stale"}}
+# (stashed by _post). Rendering rules: model-visible channels only (deny +
+# backstop advisory), at most once per 24h per machine, host-aware text,
+# client-side strict re-validation of the version string (the server field is
+# treated as untrusted input), and fail-silent on absolutely everything.
+
+_GATE_UPDATE = None
+_NUDGE_CAP_SECONDS = 86400
+# CLIENT-SIDE TWIN of mcp_server/client_update._SEMVER_RE — keep identical
+# (audit F-004): strictly X.Y.Z BY DESIGN; pre-release/v-prefixed versions
+# are intentionally never advertised. If the release scheme changes, both
+# regexes and both test vector sets change together.
+_NUDGE_SEMVER_RE = re.compile(r"^\d{1,5}\.\d{1,5}\.\d{1,5}$")
+
+
+def _nudge_state_path():
+    return os.path.join(os.path.expanduser("~"), ".truverifai", ".nudge_state.json")
+
+
+def _should_nudge():
+    """True when the 24h cap has expired (or no valid marker exists). The cap
+    deliberately does NOT reset on a newer version — rapid-release days would
+    become nudge storms; last_version_shown is stored anyway so that policy is
+    a one-line change later. Fail-open to 'nudge' on any read problem — a
+    corrupt marker SELF-HEALS because _record_nudge rewrites it after the
+    render (audit F-005); the residual (writes persistently failing too ->
+    a nudge per deny) is the accepted fail-open posture."""
+    try:
+        with open(_nudge_state_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return (time.time() - float(data.get("last_shown_at", 0))) >= _NUDGE_CAP_SECONDS
+    except Exception:
+        return True
+
+
+def _record_nudge(latest):
+    try:
+        p = _nudge_state_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"last_shown_at": time.time(),
+                       "last_version_shown": latest}, fh)
+    except Exception:
+        pass  # best-effort; never affects the gate
+
+
+def update_nudge_line():
+    """The one-line agent-actionable update nudge, or None. Renders only on
+    the server's is_stale flag (the client never compares versions — the
+    server owns the comparison); re-validates the version shape client-side;
+    respects the 24h cap and records the render."""
+    try:
+        upd = _GATE_UPDATE
+        if not (isinstance(upd, dict) and upd.get("is_stale") is True):
+            return None
+        latest = upd.get("latest_version")
+        if not (isinstance(latest, str) and _NUDGE_SEMVER_RE.fullmatch(latest)):
+            return None
+        if not _should_nudge():
+            return None
+        instruction = host_registry.current().update_instruction
+        line = ("TruVerifAI gate update available: v" + latest +
+                " (this machine runs v" + plugin_version() +
+                "; releases may include gate security fixes). " + instruction)
+        _record_nudge(latest)
+        return line
+    except Exception:
+        return None
+
+
 def emit_deny(reason, system_message=_DENY_SYSTEM_MESSAGE):
     """Emit a deny so the host blocks the tool and shows the MODEL the reason
     (the routing message — the entire product; a block without it is a wall, not
@@ -2067,6 +2532,9 @@ def emit_deny(reason, system_message=_DENY_SYSTEM_MESSAGE):
     # Stamp the running plugin version (or a staleness warning) on every deny
     # so "which version walled this" is visible and a stale hook self-announces.
     reason = reason + version_suffix()
+    nudge = update_nudge_line()
+    if nudge:
+        reason = reason + "\n" + nudge
     if system_message:
         # Some hosts surface ONLY the short user banner to the agent (observed
         # live on Cursor, G6 cert 2026-08-01: the agent saw user_message, not

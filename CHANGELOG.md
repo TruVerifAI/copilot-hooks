@@ -1,5 +1,23 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.28
+
+Catch-up republish: `copilot-hooks` had not been updated since 0.18.0, so this
+release brings the vendored gate code current with the shared cross-platform
+gate core (the primary Copilot delivery path, `npx @truverifai/init`, already
+shipped these via the npm package; this syncs the manual-install template repo).
+Includes everything between 0.18.0 and 0.19.28, notably:
+
+- **Gate-self WRITE-gate deadlock fix** — the write gate now relativizes the
+  path against the git root before the self-coverage hash, so a gate-self write
+  can be released by a real `audit_coding` PASS (previously unmatchable).
+- **Tamper-evidence self-check** — new `integrity.py` + `gate_manifest.json`:
+  the gate verifies its own files on each invocation and discloses tampering
+  (warn-loud, fail-open).
+- **Cross-platform host adapters** refreshed (`host/*.py`), classifier
+  evolution (`risk_classifier.py` / `risk_signals.json` v2.x), post-commit
+  backstop with the integrity flag, and launcher/hook updates.
+
 ## 0.18.0 (first release)
 - Write + commit gates for Copilot CLI / VS Code / Cloud Agent via
   `.github/hooks` config, generated from the shared cross-platform gate core.

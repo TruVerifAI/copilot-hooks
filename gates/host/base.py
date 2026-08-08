@@ -31,6 +31,12 @@ import sys
 
 
 class Host(object):
+
+    # Option B update nudge: the per-host, AGENT-ACTIONABLE instruction the
+    # nudge line ends with. Base = every vendored-gate host (the agent can run
+    # the command itself); hosts with a different update path override.
+    update_instruction = ("To update, run: npx @truverifai/init@latest "
+                          "(refreshes the TruVerifAI gates on this machine).")
     name = "base"
 
     # -- capabilities ------------------------------------------------------
@@ -46,6 +52,15 @@ class Host(object):
         "supports_advisory_context": True,
         "generic_nonzero_fails_closed": False,
         "stderr_reaches_model": "yes",
+        # Effective-cwd resolver stage-1 opt-out (audit mcp_a91ec2e1 F-001): a
+        # host may carry a directory-ish shell-tool argument it does NOT honor
+        # (Cursor's working_directory is documented-ignored in multi-root
+        # workspaces). A Phase-2 payload capture proving that sets this False
+        # on that host's adapter, and the resolver skips the dir-arg stage
+        # there — falling back to the payload cwd (fail-open, today's
+        # behavior), never fail-closed. cd-chain and `git -C` stages are
+        # command-authored, not host-forwarded, so they stay active.
+        "honors_dir_arg": True,
     }
 
     # Manifest filenames plugin_version() probes, relative to the plugin root
@@ -83,7 +98,20 @@ class Host(object):
         Base = Claude Code shape = identity. Adapters translate tool names, field
         casing, and write-tool input shapes; an unrecognized tool passes through
         untouched (the gates allow anything they don't recognize — fail open)."""
-        return raw or {}
+        out = dict(raw or {})
+        # Claude Code ships a native PowerShell tool on Windows (v2.1.84,
+        # PRIMARY shell since ~v2.1.139) — found live 2026-08-03 as a P1:
+        # the "Bash"-matched hooks never fired for it, so PowerShell-routed
+        # commits ran UNGATED. Widening the matcher alone would not fix it
+        # (audit_gate keys on tool_name == "Bash"), so the rename happens
+        # here too. The PowerShell tool's input carries the same {command}
+        # field as Bash, making the rename the entire mapping.
+        if out.get("tool_name") == "PowerShell":
+            # Provenance (audit F-001): keep the real tool name so logs and
+            # any downstream consumer can distinguish PowerShell commits.
+            out["original_tool_name"] = "PowerShell"
+            out["tool_name"] = "Bash"
+        return out
 
     # -- helpers shared by camelCase hosts ----------------------------------
 

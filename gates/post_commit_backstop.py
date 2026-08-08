@@ -52,7 +52,11 @@ def main():
         if not cfg["enabled"] or not cfg["token"]:
             return  # feature off / not configured
         inp = g.read_hook_input()
-        cwd = (inp.get("cwd") or os.getcwd())
+        # Effective cwd — emulates workdir args / cd-chains / `git -C`, so the
+        # backstop classifies the repo the commit actually landed in, not the
+        # session root (the 2026-08-05 Codex incident: sub-repo commits made
+        # the backstop re-report the PARENT's unrelated HEAD).
+        cwd, _ = g.resolve_effective_cwd(inp)
         decision = evaluate(g, cfg, inp, cwd)
         if not decision:
             return
@@ -217,6 +221,12 @@ def _post_dashboard_event(g, cfg, repo, uncovered_floor, session_id, pushed):
             "hunk_hashes": [h.get("content_hash") for h in uncovered_floor if h.get("content_hash")],
             "pushed": bool(pushed),
             "session_id": session_id,
+            # Tamper-evidence flag rides free on this existing wire (status label
+            # only, same as the coverage POSTs). getattr covers two distinct cases
+            # that both map to a server-side no-op: an older gate_lib without the
+            # symbol (compat default) and gate_lib's own import-failure fail-open
+            # state. Keep them no-ops together if server handling ever changes.
+            "gate_integrity": getattr(g, "_GATE_INTEGRITY", "unchecked"),
         }
         g._post(cfg, "/api/mcp/usage/unreviewed-floor-commit", body)
     except Exception:
@@ -240,6 +250,15 @@ def _emit_advisory(event_name, cats, pushed):
                "`audit_coding` on the diff, or amend. Non-blocking notice: the pre-commit review gate "
                "couldn't see this because the file was created and committed in one command.")
     ev = event_name if event_name in ("PostToolUse", "PostToolUseFailure") else "PostToolUse"
+    try:
+        # Option B: the backstop advisory is a model-visible channel, so the
+        # update nudge rides here too (same 24h cap; fail-silent).
+        import gate_lib as g
+        nudge = g.update_nudge_line()
+        if nudge:
+            msg = msg + "\n" + nudge
+    except Exception:
+        pass
     try:
         # Route through the host adapter (cursor uses snake_case
         # additional_context; base = Claude/Codex hookSpecificOutput).
