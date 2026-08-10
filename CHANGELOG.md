@@ -1,5 +1,16 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.30
+
+- **Gate-self WRITE-gate deadlock fully fixed.** The write gate's deny message
+  now prescribes the required `@@ -0,0 +1,N @@` hunk header in the diff an agent
+  submits to `audit_coding`; without it (0.19.28–0.19.29) the reviewed diff
+  parsed to zero content and a PASS could never release the write. Plus a
+  server-side guard that refuses releasing coverage for a degenerate gate-self
+  diff (content headers but no reviewable lines) while still releasing a
+  legitimate rename/mode-only change. Fail-safe unchanged.
+
+
 ## 0.19.29
 
 - **Fixed a false-positive "gate integrity" tamper warning on Windows (no actual tampering occurred).** `run_gate.js` was hashed raw (not line-ending-normalized) in the tamper-evidence manifest, so a clean install whose `run_gate.js` landed with CRLF line endings falsely reported `modified:run_gate.js` on every invocation. It is now normalized like every other gate file, so a clean install verifies clean. Informational only (the gate always enforced and failed open). **Upgrading resolves it automatically** — the new manifest ships with the update and the self-check re-runs on the next gate invocation; no reinstall step needed.
