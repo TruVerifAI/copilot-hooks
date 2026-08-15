@@ -1,5 +1,18 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.36
+
+- **Packaging fix, no behaviour change.** `gates/run_gate.cmd` had been
+  published LF-only, because the CRLF rule lived in the monorepo's root
+  `.gitattributes` and that file is never copied into this repo. `cmd.exe`
+  cannot parse an LF-only batch file. The rule now ships inside the bundle.
+- `gates/gate_selfcheck.py`: the docstring now names `python3` / `py` instead of
+  `python`, which does not exist on macOS 12.3+ or on Debian/Ubuntu without
+  `python-is-python3`. Comment only.
+- `gates/gate_manifest.json` follows the two files above (it records their
+  hashes).
+- Those are the only differences from 0.19.30. No gate logic changed.
+
 ## 0.19.30
 
 - **Gate-self WRITE-gate deadlock fully fixed.** The write gate's deny message
