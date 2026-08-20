@@ -1,5 +1,10 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.39
+- Custom floor classes: vendored gate code recognizes a repo's committed
+  `.truverifai/risk.json` custom floors (`custom_floor_*` prefix) + ReDoS-screened
+  patterns; blocks/releases exactly like the built-in floors.
+
 ## 0.19.36
 
 - **Packaging fix, no behaviour change.** `gates/run_gate.cmd` had been
