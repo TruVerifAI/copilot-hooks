@@ -1,5 +1,9 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.40
+- Custom floors: meta-config carve-out applies to `.truverifai/risk.json`
+  unconditionally (first-time authoring no longer trips a built-in floor).
+
 ## 0.19.39
 - Custom floor classes: vendored gate code recognizes a repo's committed
   `.truverifai/risk.json` custom floors (`custom_floor_*` prefix) + ReDoS-screened
