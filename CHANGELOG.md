@@ -1,5 +1,12 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.41
+- **FIX (silent coverage gap):** a custom floor whose `paths` used an exact-file
+  anchor (`^tier_config\.py$`) matched the commit gate but silently missed the WRITE
+  gate (the write gate classified against the absolute file path; preview + commit
+  gate use repo-relative). The vendored gate code now canonicalizes the write-gate
+  classifier path to repo-relative, so `^file$` floors fire at both gates.
+
 ## 0.19.40
 - Custom floors: meta-config carve-out applies to `.truverifai/risk.json`
   unconditionally (first-time authoring no longer trips a built-in floor).
