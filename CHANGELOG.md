@@ -1,5 +1,12 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.42
+- **FIX (stale advisory):** the vendored gate code's update nudge could
+  advertise an older version than the one installed (cached staleness verdict
+  outliving an update that leapfrogged the advertised target). The
+  cache-invalidation check is now a numeric semver compare (installed >=
+  advertised) and the spent cache entry is dropped so the state self-heals.
+
 ## 0.19.41
 - **FIX (silent coverage gap):** a custom floor whose `paths` used an exact-file
   anchor (`^tier_config\.py$`) matched the commit gate but silently missed the WRITE
