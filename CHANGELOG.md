@@ -1,5 +1,11 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.47
+- Vendored gate code updated to 0.19.47 (FW1 test-round fixes): the
+  "blocked BEFORE it ran" deny note is now unconditional (a chained
+  command's prefix also never ran); the human-decision ask states the
+  same. No Copilot-specific behavior change beyond the shared gate code.
+
 ## 0.19.46
 - Vendored gate code updated to 0.19.46 (external-feedback wave):
   - Gate blocks cite the REAL file line of the flagged code (A1), not `:1`.
