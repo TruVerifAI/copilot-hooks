@@ -1,5 +1,16 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.46
+- Vendored gate code updated to 0.19.46 (external-feedback wave):
+  - Gate blocks cite the REAL file line of the flagged code (A1), not `:1`.
+  - `TRUNCATE` in comments/plain strings no longer fires `sql_risk` (A3);
+    `TRUNCATE TABLE` still floors via `migration_destructive`.
+  - `package.json` fires the dependency signal only on dependency-shaped
+    added lines (A4); scripts/metadata edits stay quiet.
+  - The commit gate prints `target_hunk_hashes` (A5), ending the
+    `confirm_floor` `no_binding` dead-end.
+  - Gate selfcheck asserts the unified coverage contract.
+
 ## 0.19.42
 - **FIX (stale advisory):** the vendored gate code's update nudge could
   advertise an older version than the one installed (cached staleness verdict
