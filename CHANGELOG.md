@@ -1,5 +1,14 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.48
+- Vendored gate code updated to 0.19.48 (gates-off fix): a disabled gate
+  drains its stdin payload before exiting, and the launcher classifies a
+  stdin-pipe break as "the gate ran" instead of a launch failure, so
+  switching the gates off no longer raises false "could not be launched
+  after repair" fail-open alarms on large writes; a healthy run clears a
+  stale failure-reason file. No Copilot-specific behavior change beyond
+  the shared gate code.
+
 ## 0.19.47
 - Vendored gate code updated to 0.19.47 (FW1 test-round fixes): the
   "blocked BEFORE it ran" deny note is now unconditional (a chained
