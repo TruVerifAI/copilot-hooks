@@ -1,5 +1,11 @@
 # Changelog — TruVerifAI gates for GitHub Copilot
 
+## 0.19.49
+- Vendored gate code updated to 0.19.49 (fail-open remedies): when a gate
+  cannot run, the fail-open advisory now names the actual failure and a
+  class-matched remedy for the agent to relay (install Python 3, re-run
+  `npx @truverifai/init` to repair the install, or run doctor and share
+  the output), instead of a generic re-run suggestion.
 ## 0.19.48
 - Vendored gate code updated to 0.19.48 (gates-off fix): a disabled gate
   drains its stdin payload before exiting, and the launcher classifies a
